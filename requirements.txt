@@ -1,0 +1,4 @@
+# PHARE 2.0 Backend Dependencies
+# Python Standard Library only (http.server, socketserver, json, hashlib, etc.)
+# No external dependencies required for core functionality and WebSocket server.
+python>=3.8
