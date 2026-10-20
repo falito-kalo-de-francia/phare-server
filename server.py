@@ -189,6 +189,33 @@ clients = []
 if not users:
     print("Créez un compte avec python server.py --add-user")
 
+def bootstrap_admin_from_env():
+    with db_lock:
+        if not users:
+            admin_email = os.environ.get("PHARE_ADMIN_EMAIL")
+            admin_pwd = os.environ.get("PHARE_ADMIN_PASSWORD")
+            if admin_email and admin_pwd:
+                if len(admin_pwd) < 10:
+                    print("[SERVER] WARNING: Admin password from env must be at least 10 chars.")
+                    return
+                salt = os.urandom(16)
+                iterations = 100000
+                pwd_hash = hash_password(admin_pwd, salt, iterations)
+                agent_id = f"agent_{admin_email.split('@')[0]}"
+                users[admin_email] = {
+                    "email": admin_email,
+                    "hash": pwd_hash,
+                    "salt": base64.b64encode(salt).decode('utf-8'),
+                    "iterations": iterations,
+                    "role": "SUPERVISEUR",
+                    "site": "TOUS",
+                    "agentId": agent_id
+                }
+                save_db()
+                print(f"[SERVER] Successfully bootstrapped initial admin account: {admin_email}")
+
+bootstrap_admin_from_env()
+
 def save_db():
     try:
         data = {
@@ -308,7 +335,7 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
     def authenticate_request(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        if path in ['/health', '/api/health', '/api/login'] or path == '/ws':
+        if path in ['/health', '/api/health', '/api/login', '/api/bootstrap'] or path == '/ws':
             return True
 
         if not users:
@@ -343,6 +370,70 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            client_ip = self.client_address[0]
+
+            if path == '/api/bootstrap':
+                content_length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(content_length).decode('utf-8')
+                try:
+                    data = json.loads(body) if body else {}
+                except Exception:
+                    data = {}
+
+                with db_lock:
+                    if users:
+                        self.send_response(403)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "ERROR", "message": "Bootstrap already completed"}).encode('utf-8'))
+                        return
+
+                    setup_token = os.environ.get("PHARE_SETUP_TOKEN")
+                    if not setup_token:
+                        self.send_response(403)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "ERROR", "message": "Bootstrap token not configured on server"}).encode('utf-8'))
+                        return
+
+                    auth_token = self.headers.get('X-Setup-Token', '')
+                    if auth_token != setup_token:
+                        log_audit("BOOTSTRAP_FAILED", "unknown", client_ip, "Invalid setup token")
+                        self.send_response(401)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "ERROR", "message": "Invalid setup token"}).encode('utf-8'))
+                        return
+
+                    email = data.get('email')
+                    pwd = data.get('password')
+                    if not email or not pwd or len(pwd) < 10:
+                        self.send_response(400)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "ERROR", "message": "Email and password (min 10 chars) required"}).encode('utf-8'))
+                        return
+
+                    salt = os.urandom(16)
+                    iterations = 100000
+                    pwd_hash = hash_password(pwd, salt, iterations)
+                    agent_id = f"agent_{email.split('@')[0]}"
+                    users[email] = {
+                        "email": email,
+                        "hash": pwd_hash,
+                        "salt": base64.b64encode(salt).decode('utf-8'),
+                        "iterations": iterations,
+                        "role": "SUPERVISEUR",
+                        "site": "TOUS",
+                        "agentId": agent_id
+                    }
+                    save_db()
+                    log_audit("BOOTSTRAP_SUCCESS", email, client_ip, "Initial supervisor created")
+                    self.send_json({"status": "OK", "message": "Initial supervisor created successfully"})
+                return
+
             if not users:
                 self.send_response(503)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
