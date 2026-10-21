@@ -13,11 +13,24 @@ import traceback
 import threading
 from urllib.parse import urlparse, parse_qs
 import signal
+import urllib.request
+import urllib.error
 
 PORT = int(os.environ.get("PORT", os.environ.get("PHARE_PORT", "8080")))
-DB_FILE = os.environ.get("DATABASE_URL", os.environ.get("PHARE_DB_FILE", "phare_server_db.json"))
-if DB_FILE.startswith("sqlite:///"):
-    DB_FILE = DB_FILE.replace("sqlite:///", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", os.environ.get("PHARE_DB_FILE", "phare_server_db.json"))
+if DATABASE_URL.startswith("sqlite:///"):
+    DATABASE_URL = DATABASE_URL.replace("sqlite:///", "")
+
+IS_POSTGRES = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
+
+if IS_POSTGRES:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET_NAME", "phare-media")
+
 AUDIT_LOG_FILE = os.environ.get("PHARE_AUDIT_LOG", os.environ.get("AUDIT_LOG_FILE", "audit.log"))
 MEDIA_DIR = os.environ.get("PHARE_MEDIA_DIR", os.environ.get("MEDIA_DIR", "media_uploads"))
 os.makedirs(MEDIA_DIR, exist_ok=True)
@@ -47,6 +60,114 @@ def log_audit(action, email, ip, details=""):
     except Exception as e:
         print(f"[SERVER] Error writing to audit.log: {e}")
 
+    if IS_POSTGRES:
+        try:
+            conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO audit_logs (action, email, ip, details) VALUES (%s, %s, %s, %s)",
+                (action, email or "system", ip or "internal", details)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"[SERVER] CRITICAL ERROR writing audit log to PostgreSQL: {e}")
+            raise e
+
+def init_postgres_db():
+    if not IS_POSTGRES:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                email VARCHAR(255) PRIMARY KEY,
+                password_hash VARCHAR(255) NOT NULL,
+                salt VARCHAR(255) NOT NULL,
+                iterations INT NOT NULL DEFAULT 100000,
+                role VARCHAR(50) NOT NULL,
+                site VARCHAR(50) NOT NULL,
+                agent_id VARCHAR(255)
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash VARCHAR(255) PRIMARY KEY,
+                email VARCHAR(255) NOT NULL,
+                role VARCHAR(50) NOT NULL,
+                site VARCHAR(50) NOT NULL,
+                expires_at DOUBLE PRECISION NOT NULL,
+                supervisor_pin_validated_at DOUBLE PRECISION DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+                id VARCHAR(255) PRIMARY KEY,
+                full_name VARCHAR(255),
+                role VARCHAR(50),
+                status VARCHAR(50),
+                battery_level INT,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
+                precision DOUBLE PRECISION,
+                last_connection BIGINT,
+                site_category VARCHAR(50)
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id VARCHAR(255) PRIMARY KEY,
+                agent_id VARCHAR(255),
+                type VARCHAR(100),
+                timestamp BIGINT,
+                payload TEXT,
+                site_category VARCHAR(50)
+            );
+            CREATE TABLE IF NOT EXISTS main_courante (
+                entry_id VARCHAR(255) PRIMARY KEY,
+                site_category VARCHAR(50),
+                agent_name VARCHAR(255),
+                event_type VARCHAR(100),
+                content TEXT,
+                attachments TEXT,
+                created_by VARCHAR(255),
+                server_received_at BIGINT,
+                status VARCHAR(50),
+                agent_signed BOOLEAN,
+                agent_signed_by VARCHAR(255),
+                agent_signed_at BIGINT,
+                chef_de_poste_signed BOOLEAN,
+                chef_de_poste_signed_by VARCHAR(255),
+                chef_de_poste_signed_at BIGINT,
+                hdc_signed BOOLEAN,
+                hdc_signed_by VARCHAR(255),
+                hdc_signed_at BIGINT,
+                gph_signed BOOLEAN,
+                gph_signed_by VARCHAR(255),
+                gph_signed_at BIGINT
+            );
+            CREATE TABLE IF NOT EXISTS rounds (
+                round_id VARCHAR(255) PRIMARY KEY,
+                name VARCHAR(255),
+                description TEXT,
+                active BOOLEAN,
+                configuration_version INT,
+                points TEXT,
+                created_at BIGINT,
+                updated_at BIGINT
+            );
+            CREATE TABLE IF NOT EXISTS media_categories (
+                filename VARCHAR(255) PRIMARY KEY,
+                site_category VARCHAR(50)
+            );
+            CREATE TABLE IF NOT EXISTS kv_store (
+                key VARCHAR(255) PRIMARY KEY,
+                value TEXT
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[SERVER] PostgreSQL tables initialized successfully.")
+    except Exception as e:
+        print(f"[SERVER] Error initializing PostgreSQL tables: {e}")
+
 def load_db():
     data = {
         "agents": {},
@@ -57,14 +178,128 @@ def load_db():
         "users": {},
         "sessions": {}
     }
-    if os.path.exists(DB_FILE):
+    if IS_POSTGRES:
+        init_postgres_db()
         try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data.update(loaded)
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+
+            # users
+            cur.execute("SELECT * FROM users")
+            for row in cur.fetchall():
+                email = row["email"]
+                p_hash = row.get("password_hash") or row.get("hash")
+                data["users"][email] = {
+                    "email": email,
+                    "password_hash": p_hash,
+                    "salt": row["salt"],
+                    "iterations": row["iterations"],
+                    "role": row["role"],
+                    "site": row["site"],
+                    "agentId": row.get("agent_id")
+                }
+
+            # sessions
+            cur.execute("SELECT * FROM sessions")
+            for row in cur.fetchall():
+                data["sessions"][row["token_hash"]] = {
+                    "email": row["email"],
+                    "role": row["role"],
+                    "site": row["site"],
+                    "expires_at": row["expires_at"],
+                    "supervisor_pin_validated_at": row["supervisor_pin_validated_at"]
+                }
+
+            # agents
+            cur.execute("SELECT * FROM agents")
+            for row in cur.fetchall():
+                data["agents"][row["id"]] = {
+                    "id": row["id"],
+                    "fullName": row["full_name"],
+                    "role": row["role"],
+                    "status": row["status"],
+                    "batteryLevel": row["battery_level"],
+                    "latitude": row["latitude"],
+                    "longitude": row["longitude"],
+                    "precision": row["precision"],
+                    "lastConnection": row["last_connection"],
+                    "siteCategory": row["site_category"]
+                }
+
+            # events
+            cur.execute("SELECT * FROM events")
+            for row in cur.fetchall():
+                ev = json.loads(row["payload"]) if row["payload"] else {}
+                ev["id"] = row["id"]
+                ev["agentId"] = row["agent_id"]
+                ev["type"] = row["type"]
+                ev["timestamp"] = row["timestamp"]
+                ev["siteCategory"] = row["site_category"]
+                data["events"].append(ev)
+
+            # main_courante
+            cur.execute("SELECT * FROM main_courante")
+            for row in cur.fetchall():
+                entry = {
+                    "entryId": row["entry_id"],
+                    "siteCategory": row["site_category"],
+                    "agentName": row["agent_name"],
+                    "eventType": row["event_type"],
+                    "content": row["content"],
+                    "attachments": json.loads(row["attachments"]) if row["attachments"] else [],
+                    "createdBy": row["created_by"],
+                    "serverReceivedAt": row["server_received_at"],
+                    "status": row["status"]
+                }
+                for flag in ["agent_signed", "chef_de_poste_signed", "hdc_signed", "gph_signed"]:
+                    camel_flag = "".join(w.capitalize() if i > 0 else w for i, w in enumerate(flag.split('_')))
+                    if row.get(flag):
+                        entry[camel_flag] = True
+                        if row.get(f"{flag}_by"):
+                            entry[f"{camel_flag}By"] = row[f"{flag}_by"]
+                        if row.get(f"{flag}_at"):
+                            entry[f"{camel_flag}At"] = row[f"{flag}_at"]
+                data["main_courante"].append(entry)
+
+            # rounds
+            cur.execute("SELECT * FROM rounds")
+            for row in cur.fetchall():
+                data["rounds"][row["round_id"]] = {
+                    "roundId": row["round_id"],
+                    "name": row["name"],
+                    "description": row["description"],
+                    "active": row["active"],
+                    "configurationVersion": row["configuration_version"],
+                    "points": json.loads(row["points"]) if row["points"] else [],
+                    "createdAt": row["created_at"],
+                    "updatedAt": row["updated_at"]
+                }
+
+            # media_categories
+            cur.execute("SELECT * FROM media_categories")
+            for row in cur.fetchall():
+                data["media_categories"][row["filename"]] = row["site_category"]
+
+            # kv_store for supervisor_auth
+            cur.execute("SELECT value FROM kv_store WHERE key = 'supervisor_auth'")
+            res = cur.fetchone()
+            if res and res["value"]:
+                data["supervisor_auth"] = json.loads(res["value"])
+
+            cur.close()
+            conn.close()
         except Exception as e:
-            print(f"[SERVER] Error loading DB: {e}")
+            print(f"[SERVER] Error loading from PostgreSQL: {e}")
+    else:
+        db_path = DATABASE_URL
+        if os.path.exists(db_path):
+            try:
+                with open(db_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data.update(loaded)
+            except Exception as e:
+                print(f"[SERVER] Error loading DB: {e}")
 
     # Purge de l'ancienne ronde de démonstration (points fictifs à Paris) si elle est encore en base
     DEMO_NFC = {"NFC_A101", "NFC_B102", "NFC_C103", "NFC_D104"}
@@ -102,14 +337,16 @@ if "--setup-supervisor-pin" in sys.argv:
             "hash": pin_hash,
             "iterations": iterations
         }
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(db_data, f, ensure_ascii=False, indent=2)
+        # Save back
+        global db
+        db = db_data
+        save_db()
         print("Succès : PIN superviseur configuré et stocké de manière sécurisée (PBKDF2-HMAC-SHA256).")
     except Exception as e:
         print(f"Erreur lors de la configuration du PIN : {e}")
     sys.exit(0)
 
-# Handle command-line support for --add-user (Point 2)
+# Handle command-line support for --add-user
 if "--add-user" in sys.argv:
     print("==================================================")
     print("PHARE 2.0 - AJOUT D'UN UTILISATEUR")
@@ -165,8 +402,9 @@ if "--add-user" in sys.argv:
             "site": site,
             "agentId": agent_id
         }
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(db_data, f, ensure_ascii=False, indent=2)
+        global users
+        users = db_data["users"]
+        save_db()
         print(f"Succès : Utilisateur {email} ({role}, {site}) ajouté.")
     except Exception as e:
         print(f"Erreur lors de l'ajout de l'utilisateur : {e}")
@@ -185,7 +423,7 @@ supervisor_login_failures = {}
 acknowledgements = set()
 clients = []
 
-# If no users exist, enforce Point 1: Display message and refuse connections
+# If no users exist, display message
 if not users:
     print("Créez un compte avec python server.py --add-user")
 
@@ -200,11 +438,11 @@ def bootstrap_admin_from_env():
                     return
                 salt = os.urandom(16)
                 iterations = 100000
-                pwd_hash = hash_password(admin_pwd, salt, iterations)
+                pwd_hash = hashlib.pbkdf2_hmac('sha256', admin_pwd.encode('utf-8'), salt, iterations).hex()
                 agent_id = f"agent_{admin_email.split('@')[0]}"
                 users[admin_email] = {
                     "email": admin_email,
-                    "hash": pwd_hash,
+                    "password_hash": pwd_hash,
                     "salt": base64.b64encode(salt).decode('utf-8'),
                     "iterations": iterations,
                     "role": "SUPERVISEUR",
@@ -217,23 +455,208 @@ def bootstrap_admin_from_env():
 bootstrap_admin_from_env()
 
 def save_db():
+    if IS_POSTGRES:
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+
+            # users
+            for email, u in users.items():
+                p_hash = u.get("password_hash") or u.get("hash", "")
+                cur.execute("""
+                    INSERT INTO users (email, password_hash, salt, iterations, role, site, agent_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (email) DO UPDATE SET
+                        password_hash = EXCLUDED.password_hash,
+                        salt = EXCLUDED.salt,
+                        iterations = EXCLUDED.iterations,
+                        role = EXCLUDED.role,
+                        site = EXCLUDED.site,
+                        agent_id = EXCLUDED.agent_id
+                """, (email, p_hash, u["salt"], u.get("iterations", 100000), u["role"], u["site"], u.get("agentId")))
+
+            # sessions
+            cur.execute("DELETE FROM sessions")
+            for token_hash, s in sessions.items():
+                cur.execute("""
+                    INSERT INTO sessions (token_hash, email, role, site, expires_at, supervisor_pin_validated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (token_hash, s["email"], s["role"], s["site"], s["expires_at"], s.get("supervisor_pin_validated_at", 0)))
+
+            # agents
+            for aid, ag in agents.items():
+                cur.execute("""
+                    INSERT INTO agents (id, full_name, role, status, battery_level, latitude, longitude, precision, last_connection, site_category)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        full_name = EXCLUDED.full_name,
+                        role = EXCLUDED.role,
+                        status = EXCLUDED.status,
+                        battery_level = EXCLUDED.battery_level,
+                        latitude = EXCLUDED.latitude,
+                        longitude = EXCLUDED.longitude,
+                        precision = EXCLUDED.precision,
+                        last_connection = EXCLUDED.last_connection,
+                        site_category = EXCLUDED.site_category
+                """, (aid, ag.get("fullName"), ag.get("role"), ag.get("status"), ag.get("batteryLevel"),
+                      ag.get("latitude"), ag.get("longitude"), ag.get("precision"), ag.get("lastConnection"), ag.get("siteCategory")))
+
+            # events
+            for ev in events:
+                eid = ev.get("id")
+                if not eid:
+                    continue
+                payload_copy = dict(ev)
+                payload_copy.pop("id", None)
+                payload_copy.pop("agentId", None)
+                payload_copy.pop("type", None)
+                payload_copy.pop("timestamp", None)
+                payload_copy.pop("siteCategory", None)
+                cur.execute("""
+                    INSERT INTO events (id, agent_id, type, timestamp, payload, site_category)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        agent_id = EXCLUDED.agent_id,
+                        type = EXCLUDED.type,
+                        timestamp = EXCLUDED.timestamp,
+                        payload = EXCLUDED.payload,
+                        site_category = EXCLUDED.site_category
+                """, (eid, ev.get("agentId"), ev.get("type"), ev.get("timestamp"), json.dumps(payload_copy), ev.get("siteCategory")))
+
+            # main_courante
+            for mc in main_courante_events:
+                eid = mc.get("entryId")
+                if not eid:
+                    continue
+                cur.execute("""
+                    INSERT INTO main_courante (
+                        entry_id, site_category, agent_name, event_type, content, attachments,
+                        created_by, server_received_at, status,
+                        agent_signed, agent_signed_by, agent_signed_at,
+                        chef_de_poste_signed, chef_de_poste_signed_by, chef_de_poste_signed_at,
+                        hdc_signed, hdc_signed_by, hdc_signed_at,
+                        gph_signed, gph_signed_by, gph_signed_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (entry_id) DO UPDATE SET
+                        site_category = EXCLUDED.site_category,
+                        agent_name = EXCLUDED.agent_name,
+                        event_type = EXCLUDED.event_type,
+                        content = EXCLUDED.content,
+                        attachments = EXCLUDED.attachments,
+                        created_by = EXCLUDED.created_by,
+                        server_received_at = EXCLUDED.server_received_at,
+                        status = EXCLUDED.status,
+                        agent_signed = EXCLUDED.agent_signed,
+                        agent_signed_by = EXCLUDED.agent_signed_by,
+                        agent_signed_at = EXCLUDED.agent_signed_at,
+                        chef_de_poste_signed = EXCLUDED.chef_de_poste_signed,
+                        chef_de_poste_signed_by = EXCLUDED.chef_de_poste_signed_by,
+                        chef_de_poste_signed_at = EXCLUDED.chef_de_poste_signed_at,
+                        hdc_signed = EXCLUDED.hdc_signed,
+                        hdc_signed_by = EXCLUDED.hdc_signed_by,
+                        hdc_signed_at = EXCLUDED.hdc_signed_at,
+                        gph_signed = EXCLUDED.gph_signed,
+                        gph_signed_by = EXCLUDED.gph_signed_by,
+                        gph_signed_at = EXCLUDED.gph_signed_at
+                """, (
+                    eid, mc.get("siteCategory"), mc.get("agentName"), mc.get("eventType"),
+                    mc.get("content"), json.dumps(mc.get("attachments", [])),
+                    mc.get("createdBy"), mc.get("serverReceivedAt"), mc.get("status"),
+                    mc.get("agentSigned", False), mc.get("agentSignedBy"), mc.get("agentSignedAt"),
+                    mc.get("chefDePosteSigned", False), mc.get("chefDePosteSignedBy"), mc.get("chefDePosteSignedAt"),
+                    mc.get("hdcSigned", False), mc.get("hdcSignedBy"), mc.get("hdcSignedAt"),
+                    mc.get("gphSigned", False), mc.get("gphSignedBy"), mc.get("gphSignedAt")
+                ))
+
+            # rounds
+            for rid, r in rounds.items():
+                cur.execute("""
+                    INSERT INTO rounds (round_id, name, description, active, configuration_version, points, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (round_id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        description = EXCLUDED.description,
+                        active = EXCLUDED.active,
+                        configuration_version = EXCLUDED.configuration_version,
+                        points = EXCLUDED.points,
+                        updated_at = EXCLUDED.updated_at
+                """, (rid, r.get("name"), r.get("description"), r.get("active"), r.get("configurationVersion"),
+                      json.dumps(r.get("points", [])), r.get("createdAt"), r.get("updatedAt")))
+
+            # media_categories
+            for fn, sc in media_categories.items():
+                cur.execute("""
+                    INSERT INTO media_categories (filename, site_category)
+                    VALUES (%s, %s)
+                    ON CONFLICT (filename) DO UPDATE SET site_category = EXCLUDED.site_category
+                """, (fn, sc))
+
+            # supervisor_auth in kv_store
+            sup_auth = db.get("supervisor_auth")
+            if sup_auth:
+                cur.execute("""
+                    INSERT INTO kv_store (key, value)
+                    VALUES ('supervisor_auth', %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (json.dumps(sup_auth),))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print(f"[SERVER] CRITICAL Error saving to PostgreSQL: {e}")
+            if 'conn' in locals() and conn:
+                try: conn.close()
+                except: pass
+            raise e
+    else:
+        try:
+            data = {
+                "agents": agents,
+                "events": events,
+                "main_courante": main_courante_events,
+                "rounds": rounds,
+                "media_categories": media_categories,
+                "supervisor_auth": db.get("supervisor_auth"),
+                "users": users,
+                "sessions": sessions
+            }
+            db_path = DATABASE_URL
+            temp_file = db_path + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(temp_file, db_path)
+        except Exception as e:
+            print(f"[SERVER] Error saving DB atomically: {e}")
+
+def upload_media_to_supabase(filename, data_bytes, content_type):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return False
     try:
-        data = {
-            "agents": agents,
-            "events": events,
-            "main_courante": main_courante_events,
-            "rounds": rounds,
-            "media_categories": media_categories,
-            "supervisor_auth": db.get("supervisor_auth"),
-            "users": users,
-            "sessions": sessions
-        }
-        temp_file = DB_FILE + ".tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(temp_file, DB_FILE)
+        url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
+        req = urllib.request.Request(url, method="POST", data=data_bytes)
+        req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
+        req.add_header("Content-Type", content_type)
+        req.add_header("x-upsert", "true")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 201)
     except Exception as e:
-        print(f"[SERVER] Error saving DB atomically: {e}")
+        print(f"[SERVER] Supabase Storage upload error: {e}")
+        return False
+
+def get_media_from_supabase(filename):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {SUPABASE_KEY}")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status == 200:
+                return resp.read()
+    except Exception as e:
+        print(f"[SERVER] Supabase Storage download error: {e}")
+    return None
 
 def compute_agent_status(last_conn_ms):
     now_ms = int(1000 * time.time())
@@ -250,20 +673,18 @@ def broadcast(message_dict, target_site=None):
     dead_clients = []
     for client, client_info in clients:
         try:
-            # Scoping check (Point 6): supervisor TOUS receives all; others receive only their site
             c_role = client_info.get("role", "AGENT")
             c_site = client_info.get("site", "PATROUILLE").upper()
             if c_site == "AERO": c_site = "AERO_HOTELS"
 
             if c_role == "SUPERVISEUR" and c_site == "TOUS":
-                pass # receive all
+                pass
             elif target_site:
                 t_site = target_site.upper()
                 if t_site == "AERO": t_site = "AERO_HOTELS"
                 if t_site != c_site:
                     continue
             else:
-                # If message has siteCategory or agentId belonging to site
                 msg_site = message_dict.get("siteCategory") or message_dict.get("site")
                 if msg_site:
                     ms = msg_site.upper()
@@ -312,7 +733,6 @@ def check_access(session, resource, method, target_site=None, client_ip=""):
         return True, 200, "OK"
 
     if role == "AGENT":
-        # Point 3: AGENT has NO access to /api/agents (GET), /api/events (GET), /api/agents/acknowledge, or /api/rounds (POST)
         if resource in ["/api/agents", "/api/events"] and method == "GET":
             log_audit("UNAUTHORIZED_AGENT_ACCESS", email, client_ip, f"Agent attempted GET {resource}")
             return False, 403, "Forbidden: Agent access denied to this endpoint"
@@ -399,7 +819,7 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                         return
 
                     auth_token = self.headers.get('X-Setup-Token', '')
-                    if auth_token != setup_token:
+                    if not secrets.compare_digest(auth_token, setup_token):
                         log_audit("BOOTSTRAP_FAILED", "unknown", client_ip, "Invalid setup token")
                         self.send_response(401)
                         self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -418,11 +838,11 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
 
                     salt = os.urandom(16)
                     iterations = 100000
-                    pwd_hash = hash_password(pwd, salt, iterations)
+                    pwd_hash = hashlib.pbkdf2_hmac('sha256', pwd.encode('utf-8'), salt, iterations).hex()
                     agent_id = f"agent_{email.split('@')[0]}"
                     users[email] = {
                         "email": email,
-                        "hash": pwd_hash,
+                        "password_hash": pwd_hash,
                         "salt": base64.b64encode(salt).decode('utf-8'),
                         "iterations": iterations,
                         "role": "SUPERVISEUR",
@@ -443,10 +863,6 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
 
             if not self.authenticate_request():
                 return
-
-            parsed = urlparse(self.path)
-            path = parsed.path
-            client_ip = self.client_address[0]
 
             if path == '/ws':
                 self.handle_websocket()
@@ -498,7 +914,8 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                     iterations = user.get("iterations", 100000)
                     p_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations).hex()
 
-                    if p_hash == user["password_hash"]:
+                    stored_pwd_hash = user.get("password_hash") or user.get("hash")
+                    if p_hash == stored_pwd_hash:
                         login_failures.pop(fail_key, None)
                         token = secrets.token_hex(32)
                         token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
@@ -527,7 +944,6 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(json.dumps({"status": "ERROR", "message": "Identifiants invalides"}).encode('utf-8'))
                 return
 
-            # Check Access for other endpoints
             allowed, code, msg = check_access(self.current_session, path, "POST", client_ip=client_ip)
             if not allowed:
                 self.send_response(code)
@@ -538,7 +954,7 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
 
             if path == '/api/main-courante/upload':
                 content_length = int(self.headers.get('Content-Length', 0))
-                if content_length > 15 * 1024 * 1024: # Point 9: 15MB size limit
+                if content_length > 15 * 1024 * 1024:
                     self.send_response(413)
                     self.send_header('Content-Type', 'application/json; charset=utf-8')
                     self.end_headers()
@@ -548,7 +964,7 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                 body_bytes = self.rfile.read(content_length)
                 raw_filename = self.headers.get('X-Filename', f"media_{int(time.time())}.dat")
                 ext = os.path.splitext(raw_filename)[1] or ".dat"
-                secure_filename = f"{uuid.uuid4()}{ext}" # Point 9: UUID filename
+                secure_filename = f"{uuid.uuid4()}{ext}"
 
                 user_site = self.current_session['site'].upper()
                 if user_site == 'AERO': user_site = 'AERO_HOTELS'
@@ -563,19 +979,21 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                         return
                     user_site = hdr_site
 
+                content_type = "image/jpeg" if secure_filename.endswith((".jpg", ".jpeg", ".png")) else "video/mp4"
+                supabase_success = upload_media_to_supabase(secure_filename, body_bytes, content_type)
+
                 file_path = os.path.join(MEDIA_DIR, secure_filename)
                 try:
-                    with db_lock:
-                        with open(file_path, "wb") as f:
-                            f.write(body_bytes)
-                        media_categories[secure_filename] = user_site
-                        save_db()
-                    log_audit("MEDIA_UPLOAD", self.current_session['email'], client_ip, f"File: {secure_filename} ({len(body_bytes)} bytes)")
-                    self.send_json({"status": "OK", "filename": secure_filename, "url": f"/api/media/{secure_filename}"})
-                except Exception as e:
-                    print(f"[SERVER] Error saving media: {e}")
-                    self.send_response(500)
-                    self.end_headers()
+                    with open(file_path, "wb") as f:
+                        f.write(body_bytes)
+                except Exception as ex:
+                    print(f"[SERVER] Local media save warning: {ex}")
+
+                with db_lock:
+                    media_categories[secure_filename] = user_site
+                    save_db()
+                log_audit("MEDIA_UPLOAD", self.current_session['email'], client_ip, f"File: {secure_filename} ({len(body_bytes)} bytes, Supabase: {supabase_success})")
+                self.send_json({"status": "OK", "filename": secure_filename, "url": f"/api/media/{secure_filename}"})
                 return
 
             content_length = int(self.headers.get('Content-Length', 0))
@@ -590,7 +1008,6 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if path == '/api/supervisor/setup':
-                # Point 7: Require SUPERVISEUR role
                 if self.current_session['role'] != 'SUPERVISEUR':
                     self.send_response(403)
                     self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -682,7 +1099,7 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"status": "OK", "token": token})
                 else:
                     sup_fail["count"] += 1
-                    if sup_fail["count"] >= 5: # Point 7: 5 attempts -> 5 min block
+                    if sup_fail["count"] >= 5:
                         sup_fail["blocked_until"] = now + 300
                         sup_fail["count"] = 0
                     supervisor_login_failures[client_ip] = sup_fail
@@ -695,7 +1112,6 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
 
             with db_lock:
                 if path == '/api/agents/register':
-                    # Point 4: Agent Identity Enforcement - derive agentId strictly from session email
                     email = self.current_session['email']
                     user_rec = users.get(email, {})
                     agent_id = user_rec.get("agentId") or f"agent_{email.split('@')[0].lower()}"
@@ -734,12 +1150,10 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"status": "OK"})
 
                 elif path.startswith('/api/agents/') and path.endswith('/position'):
-                    # Point 4: Derive agentId strictly from session email
                     email = self.current_session['email']
                     user_rec = users.get(email, {})
                     agent_id = user_rec.get("agentId") or f"agent_{email.split('@')[0].lower()}"
 
-                    # Check if request attempts to post for another agent
                     req_agent_id = data.get('agentId')
                     if req_agent_id and req_agent_id != agent_id and self.current_session['role'] != 'SUPERVISEUR':
                         log_audit("UNAUTHORIZED_AGENT_SPOOF", email, client_ip, f"Attempted posting position for {req_agent_id}")
@@ -865,7 +1279,6 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"status": "RECEIVED"})
 
                 elif path == '/api/agents/acknowledge':
-                    # Point 10: Log alarm acknowledgements to audit.log
                     agent_id = data.get('agentId')
                     event_id = data.get('eventId')
                     if not agent_id or not event_id:
@@ -891,10 +1304,9 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"status": "ACKED"})
 
                 elif path == '/api/rounds':
-                    # Point 7: Sensitive actions require PIN validated within last 15 minutes
                     if self.current_session['role'] == 'SUPERVISEUR':
                         val_at = self.current_session.get("supervisor_pin_validated_at", 0)
-                        if time.time() - val_at > 900: # 15 minutes
+                        if time.time() - val_at > 900:
                             self.send_response(403)
                             self.send_header('Content-Type', 'application/json; charset=utf-8')
                             self.end_headers()
@@ -1003,7 +1415,6 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                         if k in PROTECTED or k.endswith('SignedBy') or k.endswith('SignedAt'):
                             continue
                         if k in SIGN_FLAGS:
-                            # une signature est posée une seule fois, avec le compte réel et l'heure du serveur
                             if v is True and not target_entry.get(k):
                                 target_entry[k] = True
                                 target_entry[k + 'By'] = editor
@@ -1035,9 +1446,9 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                 if path == '/ws':
                     self.handle_websocket()
                 elif path in ['/health', '/api/health']:
-                    db_status = "OK" if os.path.exists(DB_FILE) or True else "ERROR"
+                    db_status = "OK"
                     audit_status = "OK" if os.access(AUDIT_LOG_FILE, os.W_OK) or not os.path.exists(AUDIT_LOG_FILE) else "ERROR"
-                    media_status = "OK" if os.access(MEDIA_DIR, os.W_OK) else "ERROR"
+                    media_status = "OK" if os.access(MEDIA_DIR, os.W_OK) or SUPABASE_URL else "ERROR"
                     with db_lock:
                         total_ag = len(agents)
                         now_ms = int(1000 * time.time())
@@ -1102,13 +1513,10 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                     result_agents = []
                     for ag in agents.values():
                         last_conn = ag.get("lastConnection", now_ms)
-                        # Compute dynamic status
                         ag["status"] = compute_agent_status(last_conn)
-                        # Exclude offline > 24h unless ?all=1 (Point 5)
                         if not all_flag and (now_ms - last_conn > 86400 * 1000):
                             continue
 
-                        # Perimeter scoping for non-TOUS supervisor or agents
                         if self.current_session['role'] == 'SUPERVISEUR' and user_site != 'TOUS':
                             ag_site = ag.get("siteCategory", "PATROUILLE").upper()
                             if ag_site == 'AERO': ag_site = 'AERO_HOTELS'
@@ -1160,13 +1568,17 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(json.dumps({"status": "ERROR", "message": "Forbidden: Strict server-side isolation — Cross-perimeter media access denied"}).encode('utf-8'))
                         return
 
-                file_path = os.path.join(MEDIA_DIR, filename)
-                if os.path.exists(file_path):
+                file_data = get_media_from_supabase(filename)
+                if not file_data:
+                    file_path = os.path.join(MEDIA_DIR, filename)
+                    if os.path.exists(file_path):
+                        with open(file_path, "rb") as f:
+                            file_data = f.read()
+
+                if file_data is not None:
                     content_type = "image/jpeg" if filename.endswith((".jpg", ".jpeg", ".png")) else "video/mp4"
                     self.send_response(200)
                     self.send_header('Content-Type', content_type)
-                    with open(file_path, "rb") as f:
-                        file_data = f.read()
                     self.send_header('Content-Length', len(file_data))
                     self.end_headers()
                     self.wfile.write(file_data)
