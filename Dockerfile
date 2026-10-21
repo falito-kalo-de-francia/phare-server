@@ -1,19 +1,17 @@
-# PHARE 2.0 Backend Dockerfile
-# Optimized for Python 3.11 on Render, Koyeb, and Cloud Providers
 
+# PHARE 2.0 — Render / Supabase
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy dependency and application files
+# Installer les dépendances Python
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copier le serveur
 COPY server.py .
-COPY phare_server_db.json* ./
 
-# Create media uploads and audit log directories/files
-RUN mkdir -p media_uploads && touch audit.log
-
-# Environment variables
+# Configuration
 ENV PORT=8080
 ENV PHARE_PORT=8080
 ENV PYTHONUNBUFFERED=1
