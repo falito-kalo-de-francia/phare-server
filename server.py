@@ -290,6 +290,7 @@ def load_db():
             conn.close()
         except Exception as e:
             print(f"[SERVER] Error loading from PostgreSQL: {e}")
+            raise e
     else:
         db_path = DATABASE_URL
         if os.path.exists(db_path):
@@ -426,33 +427,6 @@ clients = []
 # If no users exist, display message
 if not users:
     print("Créez un compte avec python server.py --add-user")
-
-def bootstrap_admin_from_env():
-    with db_lock:
-        if not users:
-            admin_email = os.environ.get("PHARE_ADMIN_EMAIL")
-            admin_pwd = os.environ.get("PHARE_ADMIN_PASSWORD")
-            if admin_email and admin_pwd:
-                if len(admin_pwd) < 10:
-                    print("[SERVER] WARNING: Admin password from env must be at least 10 chars.")
-                    return
-                salt = os.urandom(16)
-                iterations = 100000
-                pwd_hash = hashlib.pbkdf2_hmac('sha256', admin_pwd.encode('utf-8'), salt, iterations).hex()
-                agent_id = f"agent_{admin_email.split('@')[0]}"
-                users[admin_email] = {
-                    "email": admin_email,
-                    "password_hash": pwd_hash,
-                    "salt": base64.b64encode(salt).decode('utf-8'),
-                    "iterations": iterations,
-                    "role": "SUPERVISEUR",
-                    "site": "TOUS",
-                    "agentId": agent_id
-                }
-                save_db()
-                print(f"[SERVER] Successfully bootstrapped initial admin account: {admin_email}")
-
-bootstrap_admin_from_env()
 
 def save_db():
     if IS_POSTGRES:
@@ -628,6 +602,33 @@ def save_db():
             os.replace(temp_file, db_path)
         except Exception as e:
             print(f"[SERVER] Error saving DB atomically: {e}")
+
+def bootstrap_admin_from_env():
+    with db_lock:
+        if not users:
+            admin_email = os.environ.get("PHARE_ADMIN_EMAIL")
+            admin_pwd = os.environ.get("PHARE_ADMIN_PASSWORD")
+            if admin_email and admin_pwd:
+                if len(admin_pwd) < 10:
+                    print("[SERVER] WARNING: Admin password from env must be at least 10 chars.")
+                    return
+                salt = os.urandom(16)
+                iterations = 100000
+                pwd_hash = hashlib.pbkdf2_hmac('sha256', admin_pwd.encode('utf-8'), salt, iterations).hex()
+                agent_id = f"agent_{admin_email.split('@')[0]}"
+                users[admin_email] = {
+                    "email": admin_email,
+                    "password_hash": pwd_hash,
+                    "salt": base64.b64encode(salt).decode('utf-8'),
+                    "iterations": iterations,
+                    "role": "SUPERVISEUR",
+                    "site": "TOUS",
+                    "agentId": agent_id
+                }
+                save_db()
+                print(f"[SERVER] Successfully bootstrapped initial admin account: {admin_email}")
+
+bootstrap_admin_from_env()
 
 def upload_media_to_supabase(filename, data_bytes, content_type):
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -982,12 +983,20 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                 content_type = "image/jpeg" if secure_filename.endswith((".jpg", ".jpeg", ".png")) else "video/mp4"
                 supabase_success = upload_media_to_supabase(secure_filename, body_bytes, content_type)
 
-                file_path = os.path.join(MEDIA_DIR, secure_filename)
-                try:
-                    with open(file_path, "wb") as f:
-                        f.write(body_bytes)
-                except Exception as ex:
-                    print(f"[SERVER] Local media save warning: {ex}")
+                if IS_POSTGRES:
+                    if not supabase_success:
+                        self.send_response(500)
+                        self.send_header('Content-Type', 'application/json; charset=utf-8')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"status": "ERROR", "message": "Supabase Storage required and failed in production PostgreSQL mode"}).encode('utf-8'))
+                        return
+                else:
+                    file_path = os.path.join(MEDIA_DIR, secure_filename)
+                    try:
+                        with open(file_path, "wb") as f:
+                            f.write(body_bytes)
+                    except Exception as ex:
+                        print(f"[SERVER] Local media save warning: {ex}")
 
                 with db_lock:
                     media_categories[secure_filename] = user_site
@@ -1447,6 +1456,22 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                     self.handle_websocket()
                 elif path in ['/health', '/api/health']:
                     db_status = "OK"
+                    postgres_status_val = None
+                    http_status = 200
+                    if IS_POSTGRES:
+                        try:
+                            conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+                            cur = conn.cursor()
+                            cur.execute("SELECT 1")
+                            cur.fetchone()
+                            cur.close()
+                            conn.close()
+                            postgres_status_val = "CONNECTED"
+                        except Exception as e:
+                            postgres_status_val = "UNHEALTHY"
+                            db_status = "ERROR"
+                            http_status = 503
+
                     audit_status = "OK" if os.access(AUDIT_LOG_FILE, os.W_OK) or not os.path.exists(AUDIT_LOG_FILE) else "ERROR"
                     media_status = "OK" if os.access(MEDIA_DIR, os.W_OK) or SUPABASE_URL else "ERROR"
                     with db_lock:
@@ -1455,8 +1480,8 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                         online_ag = sum(1 for ag in agents.values() if compute_agent_status(ag.get("lastConnection", now_ms)) == "EN_LIGNE")
                         lost_ag = sum(1 for ag in agents.values() if compute_agent_status(ag.get("lastConnection", now_ms)) == "PERDU")
                         offline_ag = sum(1 for ag in agents.values() if compute_agent_status(ag.get("lastConnection", now_ms)) == "HORS_LIGNE")
-                    self.send_json({
-                        "status": "HEALTHY" if db_status == "OK" and audit_status == "OK" else "DEGRADED",
+                    resp_data = {
+                        "status": "HEALTHY" if db_status == "OK" and audit_status == "OK" and (not IS_POSTGRES or postgres_status_val == "CONNECTED") else "DEGRADED",
                         "service": "PHARE 2.0 Backend",
                         "database": db_status,
                         "audit_log": audit_status,
@@ -1469,7 +1494,16 @@ class PhareServerHandler(http.server.BaseHTTPRequestHandler):
                         },
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
                         "uptime": time.time() - server_start_time
-                    })
+                    }
+                    if IS_POSTGRES:
+                        resp_data["postgresStatus"] = postgres_status_val
+
+                    response_bytes = json.dumps(resp_data).encode('utf-8')
+                    self.send_response(http_status)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Content-Length', len(response_bytes))
+                    self.end_headers()
+                    self.wfile.write(response_bytes)
                 return
 
             if not users:
