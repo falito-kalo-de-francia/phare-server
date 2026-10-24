@@ -30,8 +30,10 @@ def make_user(email, password, role, site):
     }
 
 
-def start_server(workdir):
+def start_server(workdir, env_extra=None):
     env = dict(os.environ, PHARE_PORT=str(PORT))
+    if env_extra:
+        env.update(env_extra)
     log = open(os.path.join(workdir, "server.log"), "a")
     proc = subprocess.Popen([sys.executable, SERVER], cwd=workdir, env=env,
                             stdout=log, stderr=subprocess.STDOUT)
@@ -253,6 +255,39 @@ def main():
               "Traceback" not in open(os.path.join(work, "server.log")).read(),
               "voir server.log")
         stop_server(p)
+
+        # ---- 11. admin bootstrap depuis l'environnement
+        work_adm = tempfile.mkdtemp(prefix="phare_adm_")
+        try:
+            p_adm = start_server(work_adm, env_extra={"PHARE_ADMIN_EMAIL": "admin@env.fr", "PHARE_ADMIN_PASSWORD": "adminsecurepassword123"})
+            check("admin bootstrap depuis l'environnement : login réussi", login("admin@env.fr", "adminsecurepassword123") is not None)
+            stop_server(p_adm)
+        finally:
+            shutil.rmtree(work_adm, ignore_errors=True)
+
+        # ---- 12. endpoint /api/bootstrap
+        work_boot = tempfile.mkdtemp(prefix="phare_boot_")
+        try:
+            p_boot = start_server(work_boot, env_extra={"PHARE_SETUP_TOKEN": "secret123"})
+            c, b = call("POST", "/api/bootstrap", {"email": "boot@env.fr", "password": "bootsecurepassword123"}, headers={"X-Setup-Token": "secret123"})
+            check("POST /api/bootstrap superviseur initial = 200", c == 200, (c, b))
+            check("login après /api/bootstrap réussi", login("boot@env.fr", "bootsecurepassword123") is not None)
+            stop_server(p_boot)
+        finally:
+            shutil.rmtree(work_boot, ignore_errors=True)
+
+        # ---- 13. PostgreSQL outage / invalid URL raises exception at startup
+        work_pg = tempfile.mkdtemp(prefix="phare_pg_")
+        try:
+            pg_failed = False
+            try:
+                p_pg = start_server(work_pg, env_extra={"DATABASE_URL": "postgresql://invalid:invalid@127.0.0.1:5432/invalid"})
+                stop_server(p_pg)
+            except RuntimeError:
+                pg_failed = True
+            check("PostgreSQL invalide lève une exception au démarrage (pas de DB vide silencieuse)", pg_failed)
+        finally:
+            shutil.rmtree(work_pg, ignore_errors=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
